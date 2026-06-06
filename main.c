@@ -1,10 +1,10 @@
 /*
   Remastered Controls: Resistance - PPSSPP port
 
-  Switch-safe debug branch:
+  Switch-safe diagnostic branch:
   - Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking usbpspcm0:.
   - Does not clear normal PSP input after g_init_mode == 2.
-  - Writes minimal static debug markers so we can see which hooks are reached on Switch.
+  - Logs real PSP/PPSSPP input values so Switch right-stick mapping can be diagnosed.
 */
 
 #include <pspsdk.h>
@@ -60,8 +60,15 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
-static int g_logged_ctrl = 0;
-static int g_logged_pad_packet = 0;
+
+static int g_ctrl_log_count = 0;
+static int g_packet_log_count = 0;
+static u32 g_last_buttons = 0xffffffff;
+static unsigned char g_last_lx = 0xff;
+static unsigned char g_last_ly = 0xff;
+static unsigned char g_last_rx = 0xff;
+static unsigned char g_last_ry = 0xff;
+static u16 g_last_ps3_buttons = 0xffff;
 
 void _exit(int status) {
     sceKernelExitDeleteThread(status);
@@ -83,6 +90,12 @@ static void logLine(const char *line) {
     writeLogFile(LOG_PATH_1, line);
     writeLogFile(LOG_PATH_2, line);
     writeLogFile(LOG_PATH_3, line);
+}
+
+static void logFmt(const char *fmt, int a, int b, int c, int d, int e) {
+    char line[160];
+    snprintf(line, sizeof(line), fmt, a, b, c, d, e);
+    logLine(line);
 }
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
@@ -193,15 +206,35 @@ static u16 convertButtons(u32 psp_buttons) {
     return ps3_buttons;
 }
 
+static void logInputIfChanged(const SceCtrlData *pad_data) {
+    unsigned char rx = pad_data->Rsrv[0];
+    unsigned char ry = pad_data->Rsrv[1];
+
+    if (g_ctrl_log_count >= 160)
+        return;
+
+    if (pad_data->Buttons != g_last_buttons || pad_data->Lx != g_last_lx || pad_data->Ly != g_last_ly || rx != g_last_rx || ry != g_last_ry) {
+        logFmt("INPUT buttons=0x%08x lx=%d ly=%d rx=%d ry=%d",
+               (int)pad_data->Buttons,
+               (int)pad_data->Lx,
+               (int)pad_data->Ly,
+               (int)rx,
+               (int)ry);
+
+        g_last_buttons = pad_data->Buttons;
+        g_last_lx = pad_data->Lx;
+        g_last_ly = pad_data->Ly;
+        g_last_rx = rx;
+        g_last_ry = ry;
+        g_ctrl_log_count++;
+    }
+}
+
 static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
     int res = sceCtrlReadBufferPositive(pad_data, count);
 
     memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
-
-    if (!g_logged_ctrl) {
-        logLine("CTRL_HOOK_CALLED");
-        g_logged_ctrl = 1;
-    }
+    logInputIfChanged(pad_data);
 
     return res;
 }
@@ -235,20 +268,28 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
             len = 3;
             g_init_mode++;
-            logLine("SEND_INFECTED_PACKET");
+            logFmt("SEND_INFECTED_PACKET mode=%d unused=%d unused=%d unused=%d unused=%d", infected_mode, 0, 0, 0, 0);
         } else {
+            u16 ps3_buttons = convertButtons(g_pad.Buttons);
+
             snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
                      0,
-                     convertButtons(g_pad.Buttons),
+                     ps3_buttons,
                      g_pad.Rsrv[0],
                      g_pad.Rsrv[1],
                      g_pad.Lx,
                      g_pad.Ly);
             len = 14;
 
-            if (!g_logged_pad_packet) {
-                logLine("SEND_PAD_PACKET");
-                g_logged_pad_packet = 1;
+            if (g_packet_log_count < 160 && (ps3_buttons != g_last_ps3_buttons || g_pad.Lx != g_last_lx || g_pad.Ly != g_last_ly || g_pad.Rsrv[0] != g_last_rx || g_pad.Rsrv[1] != g_last_ry)) {
+                logFmt("PACKET ps3=0x%04x lx=%d ly=%d rx=%d ry=%d",
+                       (int)ps3_buttons,
+                       (int)g_pad.Lx,
+                       (int)g_pad.Ly,
+                       (int)g_pad.Rsrv[0],
+                       (int)g_pad.Rsrv[1]);
+                g_last_ps3_buttons = ps3_buttons;
+                g_packet_log_count++;
             }
         }
 
@@ -277,6 +318,8 @@ static int sceIoClosePatched(SceUID fd) {
 }
 
 static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, int inlen, void *outdata, int outlen) {
+    logFmt("DEVCTL cmd=0x%08x inlen=%d outlen=%d unused=%d unused=%d", (int)cmd, inlen, outlen, 0, 0);
+
     if (cmd == 0x03415001) {
         u32 conn[2];
         conn[0] = 0;
@@ -292,7 +335,6 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
         return 0;
     }
 
-    logLine("DEVCTL_OTHER_CALLED");
     return sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen);
 }
 
@@ -307,12 +349,12 @@ static int sceUsbStopPatched(const char *driverName, int size, void *args) {
 }
 
 static int sceUsbActivatePatched(u32 pid) {
-    logLine("USB_ACTIVATE_CALLED");
+    logFmt("USB_ACTIVATE_CALLED pid=0x%08x unused=%d unused=%d unused=%d unused=%d", (int)pid, 0, 0, 0, 0);
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
-    logLine("USB_DEACTIVATE_CALLED");
+    logFmt("USB_DEACTIVATE_CALLED pid=0x%08x unused=%d unused=%d unused=%d unused=%d", (int)pid, 0, 0, 0, 0);
     return 0;
 }
 
@@ -333,11 +375,7 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
 
-    if (patched > 0)
-        logLine("PATCHED_IMPORTS_OK");
-    else
-        logLine("PATCHED_IMPORTS_ZERO");
-
+    logFmt("PATCH_RESULT total=%d unused=%d unused=%d unused=%d unused=%d", patched, 0, 0, 0, 0);
     return patched;
 }
 
