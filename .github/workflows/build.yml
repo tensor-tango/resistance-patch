@@ -8,28 +8,20 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install host dependencies
+      - name: Check PSP toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake git wget unzip python3 bison flex libgmp3-dev libmpfr-dev libmpc-dev texinfo libisl-dev libusb-0.1-4 libusb-dev libsdl1.2-dev libreadline-dev libncurses5-dev
-
-      - name: Build and install pspsdk toolchain
-        run: |
-          git clone --depth 1 https://github.com/pspdev/pspdev.git
-          cd pspdev
-          sudo ./prepare-debian-ubuntu.sh
-          sudo env PSPDEV=/usr/local/pspdev PATH=$PATH:/usr/local/pspdev/bin ./build-all.sh
+          psp-gcc --version
+          psp-config --pspsdk-path
 
       - name: Build plugin
         run: |
-          export PSPDEV=/usr/local/pspdev
-          export PATH=$PATH:$PSPDEV/bin
-          make clean
+          make clean || true
           make
 
       - name: Package artifact
