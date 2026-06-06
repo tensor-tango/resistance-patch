@@ -2,7 +2,7 @@ Working Right-Stick Camera/ analog camera plugin for Resistance Retribution for 
 
 Specififically for US version of the game UCUS98668.
 
-Just unpack the archive, insert an unpacked folder called "resistance_remastered_ppsspp", with $plugin.ini$ and $resistance$_$remastered.prx$ into "PLUGINS", so the whole path look like this
+Just unpack the archive, insert an unpacked folder called "resistance_remastered_ppsspp", with $plugin.ini$ and $resistance\_remastered.prx$ into "PLUGINS", so the whole path look like this
 
 ...\PPSSPP\PSP\PLUGINS\resistance_remastered_ppsspp
 
