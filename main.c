@@ -11,6 +11,8 @@
     imports are patched.
   - The right analog bytes are read by SceCtrlData layout offsets to avoid SDK
     header naming differences (Rsrv[0]/Rsrv[1] vs Rx/Ry).
+  - The fake USB stack reports an activated, cable-connected and established
+    state so Resistance's PS3 controller success path can complete on Switch.
 */
 
 #include <pspsdk.h>
@@ -45,6 +47,10 @@
 #define PS3_CTRL_R2       0x0002
 #define PS3_CTRL_L2       0x0001
 
+#define FAKE_USB_STATE    (PSP_USB_ACTIVATED | PSP_USB_CABLE_CONNECTED | PSP_USB_CONNECTION_ESTABLISHED)
+#define FAKE_USB_DRV_STARTED 1
+#define FAKE_USB_DRV_STOPPED 2
+
 #define NID_sceCtrlPeekBufferPositive 0x3A622550
 #define NID_sceCtrlReadBufferPositive 0x1F803938
 #define NID_sceIoOpen                 0x109F50BC
@@ -56,6 +62,10 @@
 #define NID_sceUsbStop                0xC2464FA0
 #define NID_sceUsbActivate            0x586DB82C
 #define NID_sceUsbDeactivate          0xC572A9C8
+#define NID_sceUsbGetState            0xC21645A4
+#define NID_sceUsbGetDrvState         0x112CC951
+#define NID_sceUsbWaitState           0x5BE0E002
+#define NID_sceUsbWaitCancel          0x1C360735
 
 /* SceCtrlData layout in user mode:
    u32 TimeStamp; u32 Buttons; u8 Lx; u8 Ly; u8 Rsrv[6];
@@ -64,12 +74,14 @@
 #define PAD_RX(p) (((unsigned char *)(p))[10])
 #define PAD_RY(p) (((unsigned char *)(p))[11])
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 1);
+PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 2);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
+static int g_usb_started = 0;
+static int g_usb_activated = 0;
 
 // Newlib's abort() wants _exit. PRX plugins should not terminate the process,
 // so satisfy the linker and kill only the current plugin thread if ever called.
@@ -194,7 +206,7 @@ static void stashPadAndHideFromGame(SceCtrlData *pad_data, int count) {
 
     memcpy(&g_pad, &pad_data[0], sizeof(SceCtrlData));
 
-    if (g_init_mode == 2) {
+    if (g_init_mode >= 2) {
         for (int i = 0; i < count; i++) {
             pad_data[i].Buttons = 0;
             pad_data[i].Lx = 128;
@@ -218,7 +230,7 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 }
 
 static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
-    if (strcmp(file, FAKE_DEVNAME) == 0)
+    if (file && strcmp(file, FAKE_DEVNAME) == 0)
         return FAKE_UID;
 
     return sceIoOpen(file, flags, mode);
@@ -295,11 +307,16 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
         u32 conn[2];
         conn[0] = 0;
         conn[1] = 0x81;
+        g_usb_started = 1;
+        g_usb_activated = 1;
         return sceKernelStartThread(*(u32 *)indata, sizeof(conn), &conn);
     } else if (cmd == 0x03415002) {
+        g_usb_started = 1;
+        g_usb_activated = 1;
         return 0;
     } else if (cmd == 0x03435005) {
-        strcpy((char *)outdata, FAKE_DEVNAME);
+        if (outdata && outlen >= (int)sizeof(FAKE_DEVNAME))
+            strcpy((char *)outdata, FAKE_DEVNAME);
         return 0;
     }
 
@@ -307,18 +324,51 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
 }
 
 static int sceUsbStartPatched(const char *driverName, int size, void *args) {
+    g_usb_started = 1;
     return 0;
 }
 
 static int sceUsbStopPatched(const char *driverName, int size, void *args) {
+    g_usb_started = 0;
+    g_usb_activated = 0;
     return 0;
 }
 
 static int sceUsbActivatePatched(u32 pid) {
+    g_usb_started = 1;
+    g_usb_activated = 1;
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
+    g_usb_activated = 0;
+    return 0;
+}
+
+static int sceUsbGetStatePatched(void) {
+    if (g_usb_started || g_usb_activated || g_init_mode > 0)
+        return FAKE_USB_STATE;
+
+    // Report cable as present even before activation; this mirrors the always-attached fake device.
+    return PSP_USB_CABLE_CONNECTED;
+}
+
+static int sceUsbGetDrvStatePatched(const char *driverName) {
+    (void)driverName;
+    return (g_usb_started || g_usb_activated || g_init_mode > 0) ? FAKE_USB_DRV_STARTED : FAKE_USB_DRV_STOPPED;
+}
+
+static int sceUsbWaitStatePatched(u32 state, s32 waitmode, u32 *timeout) {
+    (void)state;
+    (void)waitmode;
+    (void)timeout;
+
+    g_usb_started = 1;
+    g_usb_activated = 1;
+    return 0;
+}
+
+static int sceUsbWaitCancelPatched(void) {
     return 0;
 }
 
@@ -336,6 +386,10 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbStop,                sceUsbStopPatched);
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbActivate,            sceUsbActivatePatched);
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbDeactivate,          sceUsbDeactivatePatched);
+    patched += patchImportByNid(info, "sceUsb",           NID_sceUsbGetState,            sceUsbGetStatePatched);
+    patched += patchImportByNid(info, "sceUsb",           NID_sceUsbGetDrvState,         sceUsbGetDrvStatePatched);
+    patched += patchImportByNid(info, "sceUsb",           NID_sceUsbWaitState,           sceUsbWaitStatePatched);
+    patched += patchImportByNid(info, "sceUsb",           NID_sceUsbWaitCancel,          sceUsbWaitCancelPatched);
 
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
