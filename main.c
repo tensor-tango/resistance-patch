@@ -2,12 +2,9 @@
   Remastered Controls: Resistance - PPSSPP experimental port scaffold
   Based on TheFloW's Resistance RemasteredControls logic and the PPSSPP GTA port style.
 
-  Idea:
-  - Keep Resistance's built-in Resistance Plus / PS3 controller path.
-  - Fake usbpspcm0: and PS3 controller packets like the Vita/Adrenaline plugin.
-  - Instead of HEN syscall patching, patch the Resistance module's import stubs by NID.
-
-  WARNING: Experimental. Needs testing with PPSSPP and your exact Resistance build.
+  Debug build:
+  - Starts a delayed patch thread instead of patching only once in module_start.
+  - Writes debug info to ms0:/PSP/PLUGINS/resistance_remastered/log.txt
 */
 
 #include <pspsdk.h>
@@ -18,10 +15,12 @@
 #include <pspdisplay.h>
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
 
+#define LOG_PATH          "ms0:/PSP/PLUGINS/resistance_remastered/log.txt"
 #define FAKE_DEVNAME      "usbpspcm0:"
 #define FAKE_UID          0x12345678
 
@@ -42,7 +41,6 @@
 #define PS3_CTRL_R2       0x0002
 #define PS3_CTRL_L2       0x0001
 
-// NIDs used by the original Resistance plugin.
 #define NID_sceCtrlReadBufferPositive 0x1F803938
 #define NID_sceIoOpen                 0x109F50BC
 #define NID_sceIoRead                 0x6A638D83
@@ -59,6 +57,22 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
+static int g_patched = 0;
+
+static void logLine(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    SceUID fd = sceIoOpen(LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, buf, strlen(buf));
+        sceIoWrite(fd, "\n", 1);
+        sceIoClose(fd);
+    }
+}
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
     for (int i = 0; i < 4; i++) {
@@ -96,10 +110,6 @@ static int safeStrEq(const SceKernelModuleInfo *info, u32 p, const char *s) {
     return 0;
 }
 
-// Patch an import stub so calls from the game go to our replacement.
-// PSP import stubs are normally two instructions. We replace with:
-//   j replacement
-//   nop
 static void patchStub(u32 stub_addr, void *replacement) {
     u32 f = (u32)replacement;
     _sw(0x08000000 | ((f >> 2) & 0x03FFFFFF), stub_addr + 0x00); // j replacement
@@ -138,6 +148,9 @@ static int patchImportByNid(const SceKernelModuleInfo *info, const char *lib, u3
         }
     }
 
+    if (patched > 0)
+        logLine("patched import: module=%s lib=%s nid=0x%08x count=%d", info->name, lib, nid, patched);
+
     return patched;
 }
 
@@ -145,11 +158,11 @@ static u16 convertButtons(u32 psp_buttons) {
     u16 ps3_buttons = 0;
 
     if (psp_buttons & PSP_CTRL_LEFT)
-        ps3_buttons |= PS3_CTRL_LEFT | PS3_CTRL_L2; // Remap weapon select
+        ps3_buttons |= PS3_CTRL_LEFT | PS3_CTRL_L2;
     if (psp_buttons & PSP_CTRL_DOWN)
-        ps3_buttons |= PS3_CTRL_DOWN | PS3_CTRL_R3; // Remap aim
+        ps3_buttons |= PS3_CTRL_DOWN | PS3_CTRL_R3;
     if (psp_buttons & PSP_CTRL_RIGHT)
-        ps3_buttons |= PS3_CTRL_RIGHT | PS3_CTRL_R2; // Remap weapon select
+        ps3_buttons |= PS3_CTRL_RIGHT | PS3_CTRL_R2;
     if (psp_buttons & PSP_CTRL_UP)
         ps3_buttons |= PS3_CTRL_UP;
     if (psp_buttons & PSP_CTRL_START)
@@ -177,9 +190,6 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 
     if (g_init_mode == 2) {
         memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
-
-        // Once Resistance Plus is active, hide normal PSP input from the game.
-        // The game should read our fake PS3 packet through usbpspcm0: instead.
         pad_data->Buttons = 0;
         pad_data->Lx = 128;
         pad_data->Ly = 128;
@@ -191,26 +201,26 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 }
 
 static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
-    if (strcmp(file, FAKE_DEVNAME) == 0)
+    if (strcmp(file, FAKE_DEVNAME) == 0) {
+        logLine("fake open %s", file);
         return FAKE_UID;
+    }
 
     return sceIoOpen(file, flags, mode);
 }
 
 static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
     if (fd == FAKE_UID) {
-        // Original usbpspcm0: reads block; this keeps the game thread sane.
         sceDisplayWaitVblankStart();
 
         int len = 0;
 
         if (g_init_mode == 0) {
-            // Activate Resistance Plus.
             snprintf((char *)data, size, "%1d%1d", 1, 1);
             len = 3;
             g_init_mode++;
+            logLine("activate Resistance Plus");
         } else if (g_init_mode == 1) {
-            // Activate infected mode if desired.
             SceIoStat stat;
             memset(&stat, 0, sizeof(SceIoStat));
             int infected_mode = sceIoGetstat("ms0:/PSP/PLUGINS/resistance_infected.bin", &stat) >= 0 ||
@@ -219,9 +229,8 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
             len = 3;
             g_init_mode++;
+            logLine("activate infected=%d", infected_mode);
         } else {
-            // Fake PS3 controls.
-            // PPSSPP maps right analog to Rsrv[0]/Rsrv[1] when configured.
             snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
                      0,
                      convertButtons(g_pad.Buttons),
@@ -253,14 +262,17 @@ static int sceIoClosePatched(SceUID fd) {
 }
 
 static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, int inlen, void *outdata, int outlen) {
-    if (cmd == 0x03415001) { // Fake connection for register.
+    if (cmd == 0x03415001) {
         u32 conn[2];
         conn[0] = 0;
         conn[1] = 0x81;
+        logLine("fake devctl register dev=%s", dev ? dev : "null");
         return sceKernelStartThread(*(u32 *)indata, sizeof(conn), &conn);
-    } else if (cmd == 0x03415002) { // Fake success for unregister.
+    } else if (cmd == 0x03415002) {
+        logLine("fake devctl unregister dev=%s", dev ? dev : "null");
         return 0;
-    } else if (cmd == 0x03435005) { // Fake devname for bind.
+    } else if (cmd == 0x03435005) {
+        logLine("fake devctl bind dev=%s", dev ? dev : "null");
         strcpy((char *)outdata, FAKE_DEVNAME);
         return 0;
     }
@@ -269,23 +281,29 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
 }
 
 static int sceUsbStartPatched(const char *driverName, int size, void *args) {
+    logLine("fake usb start %s", driverName ? driverName : "null");
     return 0;
 }
 
 static int sceUsbStopPatched(const char *driverName, int size, void *args) {
+    logLine("fake usb stop %s", driverName ? driverName : "null");
     return 0;
 }
 
 static int sceUsbActivatePatched(u32 pid) {
+    logLine("fake usb activate 0x%08x", pid);
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
+    logLine("fake usb deactivate 0x%08x", pid);
     return 0;
 }
 
 static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     int patched = 0;
+
+    logLine("patching module=%s text=0x%08x size=0x%08x", info->name, info->text_addr, info->text_size);
 
     patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlReadBufferPositive, sceCtrlReadBufferPositivePatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoOpen,                 sceIoOpenPatched);
@@ -293,7 +311,6 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoWrite,                sceIoWritePatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoClose,                sceIoClosePatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoDevctl,               sceIoDevctlPatched);
-
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbStart,               sceUsbStartPatched);
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbStop,                sceUsbStopPatched);
     patched += patchImportByNid(info, "sceUsb",           NID_sceUsbActivate,            sceUsbActivatePatched);
@@ -302,16 +319,22 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
 
+    logLine("patch result module=%s total=%d", info->name, patched);
     return patched;
 }
 
-static void CheckModules(void) {
-    SceUID modules[32];
+static int TryPatchOnce(int log_modules) {
+    SceUID modules[64];
     SceKernelModuleInfo info;
     int count = 0;
 
-    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0)
-        return;
+    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0) {
+        logLine("sceKernelGetModuleIdList failed");
+        return 0;
+    }
+
+    if (log_modules)
+        logLine("module count=%d", count);
 
     for (int i = 0; i < count; i++) {
         memset(&info, 0, sizeof(info));
@@ -320,18 +343,48 @@ static void CheckModules(void) {
         if (sceKernelQueryModuleInfo(modules[i], &info) < 0)
             continue;
 
+        if (log_modules)
+            logLine("module[%d]=%s text=0x%08x size=0x%08x", i, info.name, info.text_addr, info.text_size);
+
         if (strcmp(info.name, "Resistance") == 0) {
-            PatchResistanceModule(&info);
-            return;
+            int patched = PatchResistanceModule(&info);
+            if (patched > 0) {
+                g_patched = 1;
+                return patched;
+            }
         }
     }
+
+    return 0;
+}
+
+static int PatchThread(SceSize args, void *argp) {
+    sceIoRemove(LOG_PATH);
+    logLine("ResistancePPSSPP loaded");
+
+    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0) {
+        logLine("not PPSSPP / kemulator check failed");
+        return 0;
+    }
+
+    logLine("PPSSPP detected, waiting for Resistance module");
+
+    for (int attempt = 0; attempt < 120 && !g_patched; attempt++) {
+        int patched = TryPatchOnce(attempt == 0 || attempt == 30 || attempt == 60 || attempt == 119);
+        if (patched > 0) {
+            logLine("patched successfully on attempt=%d", attempt);
+            return 0;
+        }
+        sceKernelDelayThread(100000); // 100 ms
+    }
+
+    logLine("failed: Resistance module not found or patched=0");
+    return 0;
 }
 
 int module_start(SceSize argc, void *argp) {
-    // Only run under PPSSPP.
-    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) == 0) {
-        CheckModules();
-    }
-
+    SceUID thid = sceKernelCreateThread("res_patch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
+    if (thid >= 0)
+        sceKernelStartThread(thid, 0, NULL);
     return 0;
 }
