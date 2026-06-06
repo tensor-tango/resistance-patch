@@ -13,6 +13,8 @@
     header naming differences (Rsrv[0]/Rsrv[1] vs Rx/Ry).
   - The fake USB stack reports an activated, cable-connected and established
     state so Resistance's PS3 controller success path can complete on Switch.
+  - USB callback arguments are kept in static storage. Passing stack memory to
+    sceKernelStartThread can race on Switch and break the PS3-mode handshake.
 */
 
 #include <pspsdk.h>
@@ -74,7 +76,7 @@
 #define PAD_RX(p) (((unsigned char *)(p))[10])
 #define PAD_RY(p) (((unsigned char *)(p))[11])
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 2);
+PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 3);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
@@ -82,6 +84,8 @@ static int g_init_mode = 0;
 static int g_patched = 0;
 static int g_usb_started = 0;
 static int g_usb_activated = 0;
+static int g_fake_open_count = 0;
+static u32 g_usb_callback_args[2] = { 0, 0x81 };
 
 // Newlib's abort() wants _exit. PRX plugins should not terminate the process,
 // so satisfy the linker and kill only the current plugin thread if ever called.
@@ -230,8 +234,12 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 }
 
 static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
-    if (file && strcmp(file, FAKE_DEVNAME) == 0)
+    if (file && strcmp(file, FAKE_DEVNAME) == 0) {
+        g_fake_open_count++;
+        g_usb_started = 1;
+        g_usb_activated = 1;
         return FAKE_UID;
+    }
 
     return sceIoOpen(file, flags, mode);
 }
@@ -296,26 +304,32 @@ static int sceIoWritePatched(SceUID fd, const void *data, SceSize size) {
 }
 
 static int sceIoClosePatched(SceUID fd) {
-    if (fd == FAKE_UID)
+    if (fd == FAKE_UID) {
+        if (g_fake_open_count > 0)
+            g_fake_open_count--;
         return 0;
+    }
 
     return sceIoClose(fd);
 }
 
 static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, int inlen, void *outdata, int outlen) {
     if (cmd == 0x03415001) {
-        u32 conn[2];
-        conn[0] = 0;
-        conn[1] = 0x81;
+        g_usb_callback_args[0] = 0;
+        g_usb_callback_args[1] = 0x81;
         g_usb_started = 1;
         g_usb_activated = 1;
-        return sceKernelStartThread(*(u32 *)indata, sizeof(conn), &conn);
+
+        if (indata && inlen >= 4)
+            return sceKernelStartThread(*(SceUID *)indata, sizeof(g_usb_callback_args), g_usb_callback_args);
+
+        return 0;
     } else if (cmd == 0x03415002) {
         g_usb_started = 1;
         g_usb_activated = 1;
         return 0;
     } else if (cmd == 0x03435005) {
-        if (outdata && outlen >= (int)sizeof(FAKE_DEVNAME))
+        if (outdata)
             strcpy((char *)outdata, FAKE_DEVNAME);
         return 0;
     }
@@ -346,7 +360,7 @@ static int sceUsbDeactivatePatched(u32 pid) {
 }
 
 static int sceUsbGetStatePatched(void) {
-    if (g_usb_started || g_usb_activated || g_init_mode > 0)
+    if (g_usb_started || g_usb_activated || g_init_mode > 0 || g_fake_open_count > 0)
         return FAKE_USB_STATE;
 
     // Report cable as present even before activation; this mirrors the always-attached fake device.
@@ -355,7 +369,7 @@ static int sceUsbGetStatePatched(void) {
 
 static int sceUsbGetDrvStatePatched(const char *driverName) {
     (void)driverName;
-    return (g_usb_started || g_usb_activated || g_init_mode > 0) ? FAKE_USB_DRV_STARTED : FAKE_USB_DRV_STOPPED;
+    return (g_usb_started || g_usb_activated || g_init_mode > 0 || g_fake_open_count > 0) ? FAKE_USB_DRV_STARTED : FAKE_USB_DRV_STOPPED;
 }
 
 static int sceUsbWaitStatePatched(u32 state, s32 waitmode, u32 *timeout) {
