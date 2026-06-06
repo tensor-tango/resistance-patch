@@ -6,7 +6,7 @@ Just unpack the archive, insert an unpacked folder called "resistance_remastered
 
 ...\PPSSPP\PSP\PLUGINS\resistance_remastered_ppsspp
 
-Map right analog stick in "Extenden PSP Control"
+Map right analog stick in "Extendend PSP Control"
 
 Thanks to Freakler and TheOfficialFlow
 
