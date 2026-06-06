@@ -29,11 +29,9 @@ jobs:
           mkdir -p output/resistance_remastered
           cp resistance_remastered.prx output/resistance_remastered/
           cp plugin.ini output/resistance_remastered/
-          cd output
-          zip -r resistance_remastered_ppsspp.zip resistance_remastered
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: resistance_remastered_ppsspp
-          path: output/resistance_remastered_ppsspp.zip
+          path: output/resistance_remastered/
