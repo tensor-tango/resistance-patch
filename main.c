@@ -20,10 +20,6 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef unsigned char u8;
-
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
 
 #define FAKE_DEVNAME      "usbpspcm0:"
@@ -64,18 +60,6 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
 
-// Minimal import stub table shape used by PSP modules.
-typedef struct SceLibraryStubTable {
-    u32 libname;
-    u16 version;
-    u16 attribute;
-    u8  size;
-    u8  vstub_size;
-    u16 stub_count;
-    u32 nidtable;
-    u32 stubtable;
-} SceLibraryStubTable;
-
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
     for (int i = 0; i < 4; i++) {
         u32 start = info->segmentaddr[i];
@@ -88,6 +72,8 @@ static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
 
 static int rangeInModule(const SceKernelModuleInfo *info, u32 p, u32 len) {
     if (!ptrInModule(info, p))
+        return 0;
+    if (len == 0)
         return 0;
     if (!ptrInModule(info, p + len - 1))
         return 0;
@@ -132,19 +118,19 @@ static int patchImportByNid(const SceKernelModuleInfo *info, const char *lib, u3
         for (u32 p = start; p + sizeof(SceLibraryStubTable) <= start + size; p += 4) {
             SceLibraryStubTable *stub = (SceLibraryStubTable *)p;
 
-            if (stub->stub_count == 0 || stub->stub_count > 256)
+            if (stub->stubcount == 0 || stub->stubcount > 256)
                 continue;
-            if (!safeStrEq(info, stub->libname, lib))
+            if (!safeStrEq(info, (u32)stub->libname, lib))
                 continue;
-            if (!rangeInModule(info, stub->nidtable, stub->stub_count * sizeof(u32)))
+            if (!rangeInModule(info, (u32)stub->nidtable, stub->stubcount * sizeof(u32)))
                 continue;
-            if (!rangeInModule(info, stub->stubtable, stub->stub_count * 8))
+            if (!rangeInModule(info, (u32)stub->stubtable, stub->stubcount * 8))
                 continue;
 
             u32 *nids = (u32 *)stub->nidtable;
-            for (int i = 0; i < stub->stub_count; i++) {
+            for (int i = 0; i < stub->stubcount; i++) {
                 if (nids[i] == nid) {
-                    u32 stub_addr = stub->stubtable + i * 8;
+                    u32 stub_addr = (u32)stub->stubtable + i * 8;
                     patchStub(stub_addr, replacement);
                     patched++;
                 }
