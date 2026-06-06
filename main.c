@@ -1,10 +1,6 @@
 /*
   Remastered Controls: Resistance - PPSSPP experimental port scaffold
-  Based on TheFloW's Resistance RemasteredControls logic and the PPSSPP GTA port style.
-
-  Debug build:
-  - Starts a delayed patch thread instead of patching only once in module_start.
-  - Writes debug info to ms0:/PSP/PLUGINS/resistance_remastered/log.txt
+  Debug build: writes log to multiple memory stick paths.
 */
 
 #include <pspsdk.h>
@@ -20,7 +16,10 @@
 
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
 
-#define LOG_PATH          "ms0:/PSP/PLUGINS/resistance_remastered/log.txt"
+#define LOG_PATH_1        "ms0:/resistance_debug.txt"
+#define LOG_PATH_2        "ms0:/PSP/resistance_debug.txt"
+#define LOG_PATH_3        "ms0:/PSP/PLUGINS/resistance_remastered/log.txt"
+
 #define FAKE_DEVNAME      "usbpspcm0:"
 #define FAKE_UID          0x12345678
 
@@ -59,6 +58,15 @@ static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
 
+static void writeOneLog(const char *path, const char *line) {
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, line, strlen(line));
+        sceIoWrite(fd, "\n", 1);
+        sceIoClose(fd);
+    }
+}
+
 static void logLine(const char *fmt, ...) {
     char buf[256];
     va_list ap;
@@ -66,12 +74,9 @@ static void logLine(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    SceUID fd = sceIoOpen(LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, buf, strlen(buf));
-        sceIoWrite(fd, "\n", 1);
-        sceIoClose(fd);
-    }
+    writeOneLog(LOG_PATH_1, buf);
+    writeOneLog(LOG_PATH_2, buf);
+    writeOneLog(LOG_PATH_3, buf);
 }
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
@@ -112,8 +117,8 @@ static int safeStrEq(const SceKernelModuleInfo *info, u32 p, const char *s) {
 
 static void patchStub(u32 stub_addr, void *replacement) {
     u32 f = (u32)replacement;
-    _sw(0x08000000 | ((f >> 2) & 0x03FFFFFF), stub_addr + 0x00); // j replacement
-    _sw(0x00000000, stub_addr + 0x04);                           // nop
+    _sw(0x08000000 | ((f >> 2) & 0x03FFFFFF), stub_addr + 0x00);
+    _sw(0x00000000, stub_addr + 0x04);
 }
 
 static int patchImportByNid(const SceKernelModuleInfo *info, const char *lib, u32 nid, void *replacement) {
@@ -359,8 +364,10 @@ static int TryPatchOnce(int log_modules) {
 }
 
 static int PatchThread(SceSize args, void *argp) {
-    sceIoRemove(LOG_PATH);
-    logLine("ResistancePPSSPP loaded");
+    sceIoRemove(LOG_PATH_1);
+    sceIoRemove(LOG_PATH_2);
+    sceIoRemove(LOG_PATH_3);
+    logLine("ResistancePPSSPP thread started");
 
     if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0) {
         logLine("not PPSSPP / kemulator check failed");
@@ -375,7 +382,7 @@ static int PatchThread(SceSize args, void *argp) {
             logLine("patched successfully on attempt=%d", attempt);
             return 0;
         }
-        sceKernelDelayThread(100000); // 100 ms
+        sceKernelDelayThread(100000);
     }
 
     logLine("failed: Resistance module not found or patched=0");
@@ -383,8 +390,15 @@ static int PatchThread(SceSize args, void *argp) {
 }
 
 int module_start(SceSize argc, void *argp) {
+    logLine("ResistancePPSSPP module_start entered");
+
     SceUID thid = sceKernelCreateThread("res_patch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
-    if (thid >= 0)
+    if (thid >= 0) {
+        logLine("thread created id=%d", thid);
         sceKernelStartThread(thid, 0, NULL);
+    } else {
+        logLine("thread create failed id=%d", thid);
+    }
+
     return 0;
 }
