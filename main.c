@@ -1,6 +1,8 @@
 /*
-  Remastered Controls: Resistance - PPSSPP experimental port scaffold
-  Debug build: writes log to multiple memory stick paths.
+  Remastered Controls: Resistance - PPSSPP port
+
+  Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking
+  usbpspcm0: and PS3 controller packets under PPSSPP.
 */
 
 #include <pspsdk.h>
@@ -11,14 +13,9 @@
 #include <pspdisplay.h>
 
 #include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
 
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
-
-#define LOG_PATH_1        "ms0:/resistance_debug.txt"
-#define LOG_PATH_2        "ms0:/PSP/resistance_debug.txt"
-#define LOG_PATH_3        "ms0:/PSP/PLUGINS/resistance_remastered/log.txt"
 
 #define FAKE_DEVNAME      "usbpspcm0:"
 #define FAKE_UID          0x12345678
@@ -58,34 +55,13 @@ static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
 
-// Newlib's abort() wants _exit. PRX plugins normally should not terminate the process,
-// so satisfy the linker and kill only the current plugin thread if this is ever called.
+// Newlib's abort() wants _exit. PRX plugins should not terminate the process,
+// so satisfy the linker and kill only the current plugin thread if ever called.
 void _exit(int status) {
     sceKernelExitDeleteThread(status);
     while (1) {
         sceKernelDelayThread(1000000);
     }
-}
-
-static void writeOneLog(const char *path, const char *line) {
-    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, line, strlen(line));
-        sceIoWrite(fd, "\n", 1);
-        sceIoClose(fd);
-    }
-}
-
-static void logLine(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    writeOneLog(LOG_PATH_1, buf);
-    writeOneLog(LOG_PATH_2, buf);
-    writeOneLog(LOG_PATH_3, buf);
 }
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
@@ -162,9 +138,6 @@ static int patchImportByNid(const SceKernelModuleInfo *info, const char *lib, u3
         }
     }
 
-    if (patched > 0)
-        logLine("patched import: module=%s lib=%s nid=0x%08x count=%d", info->name, lib, nid, patched);
-
     return patched;
 }
 
@@ -215,10 +188,8 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 }
 
 static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
-    if (strcmp(file, FAKE_DEVNAME) == 0) {
-        logLine("fake open %s", file);
+    if (strcmp(file, FAKE_DEVNAME) == 0)
         return FAKE_UID;
-    }
 
     return sceIoOpen(file, flags, mode);
 }
@@ -233,7 +204,6 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 1, 1);
             len = 3;
             g_init_mode++;
-            logLine("activate Resistance Plus");
         } else if (g_init_mode == 1) {
             SceIoStat stat;
             memset(&stat, 0, sizeof(SceIoStat));
@@ -243,7 +213,6 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
             len = 3;
             g_init_mode++;
-            logLine("activate infected=%d", infected_mode);
         } else {
             snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
                      0,
@@ -280,13 +249,10 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
         u32 conn[2];
         conn[0] = 0;
         conn[1] = 0x81;
-        logLine("fake devctl register dev=%s", dev ? dev : "null");
         return sceKernelStartThread(*(u32 *)indata, sizeof(conn), &conn);
     } else if (cmd == 0x03415002) {
-        logLine("fake devctl unregister dev=%s", dev ? dev : "null");
         return 0;
     } else if (cmd == 0x03435005) {
-        logLine("fake devctl bind dev=%s", dev ? dev : "null");
         strcpy((char *)outdata, FAKE_DEVNAME);
         return 0;
     }
@@ -295,29 +261,23 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
 }
 
 static int sceUsbStartPatched(const char *driverName, int size, void *args) {
-    logLine("fake usb start %s", driverName ? driverName : "null");
     return 0;
 }
 
 static int sceUsbStopPatched(const char *driverName, int size, void *args) {
-    logLine("fake usb stop %s", driverName ? driverName : "null");
     return 0;
 }
 
 static int sceUsbActivatePatched(u32 pid) {
-    logLine("fake usb activate 0x%08x", pid);
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
-    logLine("fake usb deactivate 0x%08x", pid);
     return 0;
 }
 
 static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     int patched = 0;
-
-    logLine("patching module=%s text=0x%08x size=0x%08x", info->name, info->text_addr, info->text_size);
 
     patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlReadBufferPositive, sceCtrlReadBufferPositivePatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoOpen,                 sceIoOpenPatched);
@@ -333,22 +293,16 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
 
-    logLine("patch result module=%s total=%d", info->name, patched);
     return patched;
 }
 
-static int TryPatchOnce(int log_modules) {
+static int TryPatchOnce(void) {
     SceUID modules[64];
     SceKernelModuleInfo info;
     int count = 0;
 
-    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0) {
-        logLine("sceKernelGetModuleIdList failed");
+    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0)
         return 0;
-    }
-
-    if (log_modules)
-        logLine("module count=%d", count);
 
     for (int i = 0; i < count; i++) {
         memset(&info, 0, sizeof(info));
@@ -356,9 +310,6 @@ static int TryPatchOnce(int log_modules) {
 
         if (sceKernelQueryModuleInfo(modules[i], &info) < 0)
             continue;
-
-        if (log_modules)
-            logLine("module[%d]=%s text=0x%08x size=0x%08x", i, info.name, info.text_addr, info.text_size);
 
         if (strcmp(info.name, "Resistance") == 0) {
             int patched = PatchResistanceModule(&info);
@@ -373,41 +324,24 @@ static int TryPatchOnce(int log_modules) {
 }
 
 static int PatchThread(SceSize args, void *argp) {
-    sceIoRemove(LOG_PATH_1);
-    sceIoRemove(LOG_PATH_2);
-    sceIoRemove(LOG_PATH_3);
-    logLine("ResistancePPSSPP thread started");
-
-    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0) {
-        logLine("not PPSSPP / kemulator check failed");
+    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0)
         return 0;
-    }
-
-    logLine("PPSSPP detected, waiting for Resistance module");
 
     for (int attempt = 0; attempt < 120 && !g_patched; attempt++) {
-        int patched = TryPatchOnce(attempt == 0 || attempt == 30 || attempt == 60 || attempt == 119);
-        if (patched > 0) {
-            logLine("patched successfully on attempt=%d", attempt);
+        int patched = TryPatchOnce();
+        if (patched > 0)
             return 0;
-        }
+
         sceKernelDelayThread(100000);
     }
 
-    logLine("failed: Resistance module not found or patched=0");
     return 0;
 }
 
 int module_start(SceSize argc, void *argp) {
-    logLine("ResistancePPSSPP module_start entered");
-
     SceUID thid = sceKernelCreateThread("res_patch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
-    if (thid >= 0) {
-        logLine("thread created id=%d", thid);
+    if (thid >= 0)
         sceKernelStartThread(thid, 0, NULL);
-    } else {
-        logLine("thread create failed id=%d", thid);
-    }
 
     return 0;
 }
