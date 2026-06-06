@@ -3,6 +3,14 @@
 
   Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking
   usbpspcm0: and PS3 controller packets under PPSSPP.
+
+  Switch / m4xw PPSSPP notes:
+  - Keep this as a PPSSPP PRX plugin, not a native Switch NRO/plugin.
+  - The Switch standalone PPSSPP build can update extended PSP controls through
+    sceCtrlPeekBufferPositive more consistently than through Read only, so both
+    imports are patched.
+  - The right analog bytes are read by SceCtrlData layout offsets to avoid SDK
+    header naming differences (Rsrv[0]/Rsrv[1] vs Rx/Ry).
 */
 
 #include <pspsdk.h>
@@ -37,6 +45,7 @@
 #define PS3_CTRL_R2       0x0002
 #define PS3_CTRL_L2       0x0001
 
+#define NID_sceCtrlPeekBufferPositive 0x3A622550
 #define NID_sceCtrlReadBufferPositive 0x1F803938
 #define NID_sceIoOpen                 0x109F50BC
 #define NID_sceIoRead                 0x6A638D83
@@ -48,7 +57,14 @@
 #define NID_sceUsbActivate            0x586DB82C
 #define NID_sceUsbDeactivate          0xC572A9C8
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 0);
+/* SceCtrlData layout in user mode:
+   u32 TimeStamp; u32 Buttons; u8 Lx; u8 Ly; u8 Rsrv[6];
+   PPSSPP exposes extended right analog at bytes 10/11.
+*/
+#define PAD_RX(p) (((unsigned char *)(p))[10])
+#define PAD_RY(p) (((unsigned char *)(p))[11])
+
+PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
@@ -172,18 +188,32 @@ static u16 convertButtons(u32 psp_buttons) {
     return ps3_buttons;
 }
 
-static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
-    int res = sceCtrlReadBufferPositive(pad_data, count);
+static void stashPadAndHideFromGame(SceCtrlData *pad_data, int count) {
+    if (!pad_data || count <= 0)
+        return;
+
+    memcpy(&g_pad, &pad_data[0], sizeof(SceCtrlData));
 
     if (g_init_mode == 2) {
-        memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
-        pad_data->Buttons = 0;
-        pad_data->Lx = 128;
-        pad_data->Ly = 128;
-        pad_data->Rsrv[0] = 128;
-        pad_data->Rsrv[1] = 128;
+        for (int i = 0; i < count; i++) {
+            pad_data[i].Buttons = 0;
+            pad_data[i].Lx = 128;
+            pad_data[i].Ly = 128;
+            PAD_RX(&pad_data[i]) = 128;
+            PAD_RY(&pad_data[i]) = 128;
+        }
     }
+}
 
+static int sceCtrlPeekBufferPositivePatched(SceCtrlData *pad_data, int count) {
+    int res = sceCtrlPeekBufferPositive(pad_data, count);
+    stashPadAndHideFromGame(pad_data, count);
+    return res;
+}
+
+static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
+    int res = sceCtrlReadBufferPositive(pad_data, count);
+    stashPadAndHideFromGame(pad_data, count);
     return res;
 }
 
@@ -194,6 +224,15 @@ static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
     return sceIoOpen(file, flags, mode);
 }
 
+static void refreshPadForUsbPacket(void) {
+    SceCtrlData fresh;
+    memset(&fresh, 0, sizeof(fresh));
+
+    if (sceCtrlPeekBufferPositive(&fresh, 1) >= 0) {
+        memcpy(&g_pad, &fresh, sizeof(SceCtrlData));
+    }
+}
+
 static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
     if (fd == FAKE_UID) {
         sceDisplayWaitVblankStart();
@@ -202,7 +241,7 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
 
         if (g_init_mode == 0) {
             snprintf((char *)data, size, "%1d%1d", 1, 1);
-            len = 3;
+            len = 3; // Include the trailing NUL expected by the game's USB parser.
             g_init_mode++;
         } else if (g_init_mode == 1) {
             SceIoStat stat;
@@ -211,17 +250,24 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
                                 sceIoGetstat("ms0:/seplugins/resistance_infected.bin", &stat) >= 0;
 
             snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
-            len = 3;
+            len = 3; // Include the trailing NUL expected by the game's USB parser.
             g_init_mode++;
         } else {
+            /*
+              On Switch/m4xw PPSSPP, relying only on the previous Read callback
+              can leave g_pad stale. Refresh right before building the fake PS3
+              packet so Extended PSP right analog values are current.
+            */
+            refreshPadForUsbPacket();
+
             snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
                      0,
                      convertButtons(g_pad.Buttons),
-                     g_pad.Rsrv[0],
-                     g_pad.Rsrv[1],
+                     PAD_RX(&g_pad),
+                     PAD_RY(&g_pad),
                      g_pad.Lx,
                      g_pad.Ly);
-            len = 14;
+            len = 14; // 13 visible bytes + trailing NUL.
         }
 
         return len;
@@ -279,6 +325,7 @@ static int sceUsbDeactivatePatched(u32 pid) {
 static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     int patched = 0;
 
+    patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlPeekBufferPositive, sceCtrlPeekBufferPositivePatched);
     patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlReadBufferPositive, sceCtrlReadBufferPositivePatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoOpen,                 sceIoOpenPatched);
     patched += patchImportByNid(info, "IoFileMgrForUser", NID_sceIoRead,                 sceIoReadPatched);
@@ -327,7 +374,8 @@ static int PatchThread(SceSize args, void *argp) {
     if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0)
         return 0;
 
-    for (int attempt = 0; attempt < 120 && !g_patched; attempt++) {
+    // Switch standalone can load the game module more slowly than desktop PPSSPP.
+    for (int attempt = 0; attempt < 300 && !g_patched; attempt++) {
         int patched = TryPatchOnce();
         if (patched > 0)
             return 0;
