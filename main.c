@@ -1,8 +1,9 @@
 /*
   Remastered Controls: Resistance - PPSSPP port
 
-  Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking
-  usbpspcm0: and PS3 controller packets under PPSSPP.
+  Switch-safe branch:
+  - Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking usbpspcm0:.
+  - Does not clear normal PSP input after g_init_mode == 2. This prevents controls from dying on PPSSPP builds where the USB Plus path does not fully activate.
 */
 
 #include <pspsdk.h>
@@ -48,15 +49,13 @@
 #define NID_sceUsbActivate            0x586DB82C
 #define NID_sceUsbDeactivate          0xC572A9C8
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 0);
+PSP_MODULE_INFO("ResistanceSwitchSafe", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
 
-// Newlib's abort() wants _exit. PRX plugins should not terminate the process,
-// so satisfy the linker and kill only the current plugin thread if ever called.
 void _exit(int status) {
     sceKernelExitDeleteThread(status);
     while (1) {
@@ -175,14 +174,7 @@ static u16 convertButtons(u32 psp_buttons) {
 static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
     int res = sceCtrlReadBufferPositive(pad_data, count);
 
-    if (g_init_mode == 2) {
-        memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
-        pad_data->Buttons = 0;
-        pad_data->Lx = 128;
-        pad_data->Ly = 128;
-        pad_data->Rsrv[0] = 128;
-        pad_data->Rsrv[1] = 128;
-    }
+    memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
 
     return res;
 }
@@ -339,7 +331,7 @@ static int PatchThread(SceSize args, void *argp) {
 }
 
 int module_start(SceSize argc, void *argp) {
-    SceUID thid = sceKernelCreateThread("res_patch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
+    SceUID thid = sceKernelCreateThread("res_switch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
     if (thid >= 0)
         sceKernelStartThread(thid, 0, NULL);
 
