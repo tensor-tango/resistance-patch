@@ -15,6 +15,9 @@
     state so Resistance's PS3 controller success path can complete on Switch.
   - USB callback arguments are kept in static storage. Passing stack memory to
     sceKernelStartThread can race on Switch and break the PS3-mode handshake.
+  - USB response packets are written manually. On Switch/m4xw PPSSPP, libc
+    snprintf() can fail to populate the game's I/O buffer even though it works
+    for the plugin's own stack buffers.
 */
 
 #include <pspsdk.h>
@@ -79,7 +82,7 @@
 #define PAD_RX(p) (((unsigned char *)(p))[10])
 #define PAD_RY(p) (((unsigned char *)(p))[11])
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 4);
+PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 5);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
@@ -92,8 +95,6 @@ static int g_packet_log_count = 0;
 static int g_debug_log_ready = 0;
 static u32 g_usb_callback_args[2] = { 0, 0x81 };
 
-// Newlib's abort() wants _exit. PRX plugins should not terminate the process,
-// so satisfy the linker and kill only the current plugin thread if ever called.
 void _exit(int status) {
     sceKernelExitDeleteThread(status);
     while (1) {
@@ -112,11 +113,12 @@ static void debugLog(const char *fmt, ...) {
 
     snprintf(line, sizeof(line), "[%08u] %s\n", sceKernelGetSystemTimeLow(), msg);
 
-    SceUID fd = sceIoOpen(DEBUG_LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    SceUID fd = sceIoOpen(DEBUG_LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT, 0777);
     if (fd < 0)
-        fd = sceIoOpen(DEBUG_LOG_PATH_2, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+        fd = sceIoOpen(DEBUG_LOG_PATH_2, PSP_O_WRONLY | PSP_O_CREAT, 0777);
 
     if (fd >= 0) {
+        sceIoLseek(fd, 0, 2);
         sceIoWrite(fd, line, strlen(line));
         sceIoClose(fd);
     }
@@ -129,7 +131,32 @@ static void debugLogOnceInit(void) {
     g_debug_log_ready = 1;
     sceIoRemove(DEBUG_LOG_PATH);
     sceIoRemove(DEBUG_LOG_PATH_2);
-    debugLog("module_start ResistancePPSSPP v1.4 debug build");
+    debugLog("module_start ResistancePPSSPP v1.5 manual-packet debug build");
+}
+
+static char hexNibble(unsigned int v) {
+    v &= 0xF;
+    return (v < 10) ? ('0' + v) : ('a' + (v - 10));
+}
+
+static void writeHex2(char *p, unsigned int v) {
+    p[0] = hexNibble(v >> 4);
+    p[1] = hexNibble(v);
+}
+
+static void writeHex4(char *p, unsigned int v) {
+    p[0] = hexNibble(v >> 12);
+    p[1] = hexNibble(v >> 8);
+    p[2] = hexNibble(v >> 4);
+    p[3] = hexNibble(v);
+}
+
+static void copyResponseBytes(void *data, SceSize size, const char *src, int len) {
+    if (!data || size == 0)
+        return;
+
+    int n = (size < (SceSize)len) ? (int)size : len;
+    memcpy(data, src, n);
 }
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
@@ -302,50 +329,62 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
         sceDisplayWaitVblankStart();
 
         int len = 0;
+        char log_packet[16];
+        memset(log_packet, 0, sizeof(log_packet));
 
         if (g_init_mode == 0) {
-            snprintf((char *)data, size, "%1d%1d", 1, 1);
-            len = 3; // Include the trailing NUL expected by the game's USB parser.
-            debugLog("io read stage0 size=%u -> '%s' len=%d", size, (char *)data, len);
+            const char response[3] = { '1', '1', '\0' };
+            copyResponseBytes(data, size, response, 3);
+            memcpy(log_packet, response, 3);
+            len = 3;
+            debugLog("io read stage0 size=%u bytes=%02x %02x %02x text='%s' len=%d",
+                     size, ((unsigned char *)data)[0], ((unsigned char *)data)[1], ((unsigned char *)data)[2], log_packet, len);
             g_init_mode++;
         } else if (g_init_mode == 1) {
             SceIoStat stat;
             memset(&stat, 0, sizeof(SceIoStat));
             int infected_mode = sceIoGetstat("ms0:/PSP/PLUGINS/resistance_infected.bin", &stat) >= 0 ||
                                 sceIoGetstat("ms0:/seplugins/resistance_infected.bin", &stat) >= 0;
-
-            snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
-            len = 3; // Include the trailing NUL expected by the game's USB parser.
-            debugLog("io read stage1 size=%u infected=%d -> '%s' len=%d", size, infected_mode, (char *)data, len);
+            char response[3] = { '2', infected_mode ? '1' : '0', '\0' };
+            copyResponseBytes(data, size, response, 3);
+            memcpy(log_packet, response, 3);
+            len = 3;
+            debugLog("io read stage1 size=%u infected=%d bytes=%02x %02x %02x text='%s' len=%d",
+                     size, infected_mode, ((unsigned char *)data)[0], ((unsigned char *)data)[1], ((unsigned char *)data)[2], log_packet, len);
             g_init_mode++;
         } else {
-            /*
-              On Switch/m4xw PPSSPP, relying only on the previous Read callback
-              can leave g_pad stale. Refresh right before building the fake PS3
-              packet so Extended PSP right analog values are current.
-            */
+            char response[14];
+            u16 buttons;
             refreshPadForUsbPacket();
+            buttons = convertButtons(g_pad.Buttons);
 
-            snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
-                     0,
-                     convertButtons(g_pad.Buttons),
-                     PAD_RX(&g_pad),
-                     PAD_RY(&g_pad),
-                     g_pad.Lx,
-                     g_pad.Ly);
-            len = 14; // 13 visible bytes + trailing NUL.
+            response[0] = '0';
+            writeHex4(&response[1], buttons);
+            writeHex2(&response[5], PAD_RX(&g_pad));
+            writeHex2(&response[7], PAD_RY(&g_pad));
+            writeHex2(&response[9], g_pad.Lx);
+            writeHex2(&response[11], g_pad.Ly);
+            response[13] = '\0';
+
+            copyResponseBytes(data, size, response, 14);
+            memcpy(log_packet, response, 14);
+            len = 14;
 
             g_packet_log_count++;
             if (g_packet_log_count <= 30 || (g_packet_log_count % 60) == 0) {
-                debugLog("io read packet#%d size=%u buttons=%08x rx=%02x ry=%02x lx=%02x ly=%02x -> '%s' len=%d",
+                debugLog("io read packet#%d size=%u buttons=%08x ps3=%04x rx=%02x ry=%02x lx=%02x ly=%02x bytes=%02x %02x %02x text='%s' len=%d",
                          g_packet_log_count,
                          size,
                          g_pad.Buttons,
+                         buttons,
                          PAD_RX(&g_pad),
                          PAD_RY(&g_pad),
                          g_pad.Lx,
                          g_pad.Ly,
-                         (char *)data,
+                         ((unsigned char *)data)[0],
+                         ((unsigned char *)data)[1],
+                         ((unsigned char *)data)[2],
+                         log_packet,
                          len);
             }
         }
@@ -539,7 +578,6 @@ static int PatchThread(SceSize args, void *argp) {
     if (emu != 0)
         return 0;
 
-    // Switch standalone can load the game module more slowly than desktop PPSSPP.
     for (int attempt = 0; attempt < 300 && !g_patched; attempt++) {
         int patched = TryPatchOnce();
         if (patched > 0) {
