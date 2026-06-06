@@ -1,0 +1,47 @@
+name: Build PPSSPP PRX
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git wget unzip python3 bison flex libgmp3-dev libmpfr-dev libmpc-dev texinfo libisl-dev libusb-0.1-4 libusb-dev libsdl1.2-dev libreadline-dev libncurses5-dev
+
+      - name: Build and install pspsdk toolchain
+        run: |
+          git clone --depth 1 https://github.com/pspdev/pspdev.git
+          cd pspdev
+          sudo ./prepare-debian-ubuntu.sh
+          sudo env PSPDEV=/usr/local/pspdev PATH=$PATH:/usr/local/pspdev/bin ./build-all.sh
+
+      - name: Build plugin
+        run: |
+          export PSPDEV=/usr/local/pspdev
+          export PATH=$PATH:$PSPDEV/bin
+          make clean
+          make
+
+      - name: Package artifact
+        run: |
+          mkdir -p output/resistance_remastered
+          cp resistance_remastered.prx output/resistance_remastered/
+          cp plugin.ini output/resistance_remastered/
+          cd output
+          zip -r resistance_remastered_ppsspp.zip resistance_remastered
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resistance_remastered_ppsspp
+          path: output/resistance_remastered_ppsspp.zip
