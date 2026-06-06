@@ -58,6 +58,15 @@ static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
 
+// Newlib's abort() wants _exit. PRX plugins normally should not terminate the process,
+// so satisfy the linker and kill only the current plugin thread if this is ever called.
+void _exit(int status) {
+    sceKernelExitDeleteThread(status);
+    while (1) {
+        sceKernelDelayThread(1000000);
+    }
+}
+
 static void writeOneLog(const char *path, const char *line) {
     SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
     if (fd >= 0) {
