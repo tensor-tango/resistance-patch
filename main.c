@@ -27,16 +27,12 @@
 #include <pspusb.h>
 #include <pspdisplay.h>
 
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
 
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
 
 #define FAKE_DEVNAME      "usbpspcm0:"
 #define FAKE_UID          0x12345678
-#define DEBUG_LOG_PATH    "ms0:/PSP/PLUGINS/resistance_switch_debug.log"
-#define DEBUG_LOG_PATH_2  "ms0:/resistance_switch_debug.log"
 
 #define PS3_CTRL_LEFT     0x8000
 #define PS3_CTRL_DOWN     0x4000
@@ -82,7 +78,7 @@
 #define PAD_RX(p) (((unsigned char *)(p))[10])
 #define PAD_RY(p) (((unsigned char *)(p))[11])
 
-PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 5);
+PSP_MODULE_INFO("ResistancePPSSPP", 0, 1, 6);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
 static SceCtrlData g_pad;
@@ -91,8 +87,6 @@ static int g_patched = 0;
 static int g_usb_started = 0;
 static int g_usb_activated = 0;
 static int g_fake_open_count = 0;
-static int g_packet_log_count = 0;
-static int g_debug_log_ready = 0;
 static u32 g_usb_callback_args[2] = { 0, 0x81 };
 
 void _exit(int status) {
@@ -100,38 +94,6 @@ void _exit(int status) {
     while (1) {
         sceKernelDelayThread(1000000);
     }
-}
-
-static void debugLog(const char *fmt, ...) {
-    char msg[256];
-    char line[320];
-    va_list ap;
-
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-
-    snprintf(line, sizeof(line), "[%08u] %s\n", sceKernelGetSystemTimeLow(), msg);
-
-    SceUID fd = sceIoOpen(DEBUG_LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT, 0777);
-    if (fd < 0)
-        fd = sceIoOpen(DEBUG_LOG_PATH_2, PSP_O_WRONLY | PSP_O_CREAT, 0777);
-
-    if (fd >= 0) {
-        sceIoLseek(fd, 0, 2);
-        sceIoWrite(fd, line, strlen(line));
-        sceIoClose(fd);
-    }
-}
-
-static void debugLogOnceInit(void) {
-    if (g_debug_log_ready)
-        return;
-
-    g_debug_log_ready = 1;
-    sceIoRemove(DEBUG_LOG_PATH);
-    sceIoRemove(DEBUG_LOG_PATH_2);
-    debugLog("module_start ResistancePPSSPP v1.5 manual-packet debug build");
 }
 
 static char hexNibble(unsigned int v) {
@@ -227,15 +189,11 @@ static int patchImportByNid(const SceKernelModuleInfo *info, const char *lib, u3
                 if (nids[i] == nid) {
                     u32 stub_addr = (u32)stub->stubtable + i * 8;
                     patchStub(stub_addr, replacement);
-                    debugLog("patch %s nid=%08x stub=%08x", lib, nid, stub_addr);
                     patched++;
                 }
             }
         }
     }
-
-    if (patched == 0)
-        debugLog("patch MISS %s nid=%08x", lib, nid);
 
     return patched;
 }
@@ -305,7 +263,6 @@ static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
         g_fake_open_count++;
         g_usb_started = 1;
         g_usb_activated = 1;
-        debugLog("io open fake dev flags=%08x mode=%08x open_count=%d", flags, mode, g_fake_open_count);
         return FAKE_UID;
     }
 
@@ -316,95 +273,53 @@ static void refreshPadForUsbPacket(void) {
     SceCtrlData fresh;
     memset(&fresh, 0, sizeof(fresh));
 
-    int res = sceCtrlPeekBufferPositive(&fresh, 1);
-    if (res >= 0) {
+    if (sceCtrlPeekBufferPositive(&fresh, 1) >= 0)
         memcpy(&g_pad, &fresh, sizeof(SceCtrlData));
-    } else {
-        debugLog("pad refresh failed res=%08x", res);
-    }
 }
 
 static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
     if (fd == FAKE_UID) {
         sceDisplayWaitVblankStart();
 
-        int len = 0;
-        char log_packet[16];
-        memset(log_packet, 0, sizeof(log_packet));
-
         if (g_init_mode == 0) {
             const char response[3] = { '1', '1', '\0' };
             copyResponseBytes(data, size, response, 3);
-            memcpy(log_packet, response, 3);
-            len = 3;
-            debugLog("io read stage0 size=%u bytes=%02x %02x %02x text='%s' len=%d",
-                     size, ((unsigned char *)data)[0], ((unsigned char *)data)[1], ((unsigned char *)data)[2], log_packet, len);
             g_init_mode++;
-        } else if (g_init_mode == 1) {
+            return 3;
+        }
+
+        if (g_init_mode == 1) {
             SceIoStat stat;
             memset(&stat, 0, sizeof(SceIoStat));
             int infected_mode = sceIoGetstat("ms0:/PSP/PLUGINS/resistance_infected.bin", &stat) >= 0 ||
                                 sceIoGetstat("ms0:/seplugins/resistance_infected.bin", &stat) >= 0;
             char response[3] = { '2', infected_mode ? '1' : '0', '\0' };
             copyResponseBytes(data, size, response, 3);
-            memcpy(log_packet, response, 3);
-            len = 3;
-            debugLog("io read stage1 size=%u infected=%d bytes=%02x %02x %02x text='%s' len=%d",
-                     size, infected_mode, ((unsigned char *)data)[0], ((unsigned char *)data)[1], ((unsigned char *)data)[2], log_packet, len);
             g_init_mode++;
-        } else {
-            char response[14];
-            u16 buttons;
-            refreshPadForUsbPacket();
-            buttons = convertButtons(g_pad.Buttons);
-
-            response[0] = '0';
-            writeHex4(&response[1], buttons);
-            writeHex2(&response[5], PAD_RX(&g_pad));
-            writeHex2(&response[7], PAD_RY(&g_pad));
-            writeHex2(&response[9], g_pad.Lx);
-            writeHex2(&response[11], g_pad.Ly);
-            response[13] = '\0';
-
-            copyResponseBytes(data, size, response, 14);
-            memcpy(log_packet, response, 14);
-            len = 14;
-
-            g_packet_log_count++;
-            if (g_packet_log_count <= 30 || (g_packet_log_count % 60) == 0) {
-                debugLog("io read packet#%d size=%u buttons=%08x ps3=%04x rx=%02x ry=%02x lx=%02x ly=%02x bytes=%02x %02x %02x text='%s' len=%d",
-                         g_packet_log_count,
-                         size,
-                         g_pad.Buttons,
-                         buttons,
-                         PAD_RX(&g_pad),
-                         PAD_RY(&g_pad),
-                         g_pad.Lx,
-                         g_pad.Ly,
-                         ((unsigned char *)data)[0],
-                         ((unsigned char *)data)[1],
-                         ((unsigned char *)data)[2],
-                         log_packet,
-                         len);
-            }
+            return 3;
         }
 
-        return len;
+        char response[14];
+        refreshPadForUsbPacket();
+
+        response[0] = '0';
+        writeHex4(&response[1], convertButtons(g_pad.Buttons));
+        writeHex2(&response[5], PAD_RX(&g_pad));
+        writeHex2(&response[7], PAD_RY(&g_pad));
+        writeHex2(&response[9], g_pad.Lx);
+        writeHex2(&response[11], g_pad.Ly);
+        response[13] = '\0';
+
+        copyResponseBytes(data, size, response, 14);
+        return 14;
     }
 
     return sceIoRead(fd, data, size);
 }
 
 static int sceIoWritePatched(SceUID fd, const void *data, SceSize size) {
-    if (fd == FAKE_UID) {
-        char preview[33];
-        int n = size < 32 ? size : 32;
-        memset(preview, 0, sizeof(preview));
-        if (data && n > 0)
-            memcpy(preview, data, n);
-        debugLog("io write fake size=%u data='%s'", size, preview);
+    if (fd == FAKE_UID)
         return size;
-    }
 
     return sceIoWrite(fd, data, size);
 }
@@ -413,7 +328,6 @@ static int sceIoClosePatched(SceUID fd) {
     if (fd == FAKE_UID) {
         if (g_fake_open_count > 0)
             g_fake_open_count--;
-        debugLog("io close fake open_count=%d", g_fake_open_count);
         return 0;
     }
 
@@ -421,100 +335,79 @@ static int sceIoClosePatched(SceUID fd) {
 }
 
 static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, int inlen, void *outdata, int outlen) {
-    debugLog("devctl dev='%s' cmd=%08x inlen=%d outlen=%d in=%08x out=%08x",
-             dev ? dev : "NULL", cmd, inlen, outlen, (u32)indata, (u32)outdata);
-
     if (cmd == 0x03415001) {
         g_usb_callback_args[0] = 0;
         g_usb_callback_args[1] = 0x81;
         g_usb_started = 1;
         g_usb_activated = 1;
 
-        if (indata && inlen >= 4) {
-            SceUID callback_thread = *(SceUID *)indata;
-            int res = sceKernelStartThread(callback_thread, sizeof(g_usb_callback_args), g_usb_callback_args);
-            debugLog("devctl connect callback thread=%08x res=%08x args=%08x,%08x", callback_thread, res, g_usb_callback_args[0], g_usb_callback_args[1]);
-            return res;
-        }
+        if (indata && inlen >= 4)
+            return sceKernelStartThread(*(SceUID *)indata, sizeof(g_usb_callback_args), g_usb_callback_args);
 
-        debugLog("devctl connect no callback thread");
-        return 0;
-    } else if (cmd == 0x03415002) {
-        g_usb_started = 1;
-        g_usb_activated = 1;
-        debugLog("devctl ack/start cmd 03415002");
-        return 0;
-    } else if (cmd == 0x03435005) {
-        if (outdata)
-            strcpy((char *)outdata, FAKE_DEVNAME);
-        debugLog("devctl get devname -> %s", outdata ? (char *)outdata : "NULL");
         return 0;
     }
 
-    int res = sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen);
-    debugLog("devctl passthrough cmd=%08x res=%08x", cmd, res);
-    return res;
+    if (cmd == 0x03415002) {
+        g_usb_started = 1;
+        g_usb_activated = 1;
+        return 0;
+    }
+
+    if (cmd == 0x03435005) {
+        if (outdata)
+            strcpy((char *)outdata, FAKE_DEVNAME);
+        return 0;
+    }
+
+    return sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen);
 }
 
 static int sceUsbStartPatched(const char *driverName, int size, void *args) {
     g_usb_started = 1;
-    debugLog("usb start driver='%s' size=%d args=%08x", driverName ? driverName : "NULL", size, (u32)args);
     return 0;
 }
 
 static int sceUsbStopPatched(const char *driverName, int size, void *args) {
     g_usb_started = 0;
     g_usb_activated = 0;
-    debugLog("usb stop driver='%s' size=%d args=%08x", driverName ? driverName : "NULL", size, (u32)args);
     return 0;
 }
 
 static int sceUsbActivatePatched(u32 pid) {
     g_usb_started = 1;
     g_usb_activated = 1;
-    debugLog("usb activate pid=%08x", pid);
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
     g_usb_activated = 0;
-    debugLog("usb deactivate pid=%08x", pid);
     return 0;
 }
 
 static int sceUsbGetStatePatched(void) {
-    int state;
     if (g_usb_started || g_usb_activated || g_init_mode > 0 || g_fake_open_count > 0)
-        state = FAKE_USB_STATE;
-    else
-        state = PSP_USB_CABLE_CONNECTED;
+        return FAKE_USB_STATE;
 
-    debugLog("usb getState -> %08x started=%d activated=%d init=%d open=%d", state, g_usb_started, g_usb_activated, g_init_mode, g_fake_open_count);
-    return state;
+    return PSP_USB_CABLE_CONNECTED;
 }
 
 static int sceUsbGetDrvStatePatched(const char *driverName) {
-    int state = (g_usb_started || g_usb_activated || g_init_mode > 0 || g_fake_open_count > 0) ? FAKE_USB_DRV_STARTED : FAKE_USB_DRV_STOPPED;
-    debugLog("usb getDrvState driver='%s' -> %d", driverName ? driverName : "NULL", state);
-    return state;
+    return (g_usb_started || g_usb_activated || g_init_mode > 0 || g_fake_open_count > 0) ?
+        FAKE_USB_DRV_STARTED : FAKE_USB_DRV_STOPPED;
 }
 
 static int sceUsbWaitStatePatched(u32 state, s32 waitmode, u32 *timeout) {
     g_usb_started = 1;
     g_usb_activated = 1;
-    debugLog("usb waitState state=%08x waitmode=%d timeout=%08x -> 0", state, waitmode, (u32)timeout);
     return 0;
 }
 
 static int sceUsbWaitCancelPatched(void) {
-    debugLog("usb waitCancel -> 0");
     return 0;
 }
 
 static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     int patched = 0;
-
-    debugLog("patch module name='%s' text=%08x size=%08x", info->name, info->segmentaddr[0], info->segmentsize[0]);
 
     patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlPeekBufferPositive, sceCtrlPeekBufferPositivePatched);
     patched += patchImportByNid(info, "sceCtrl",          NID_sceCtrlReadBufferPositive, sceCtrlReadBufferPositivePatched);
@@ -535,7 +428,6 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
 
-    debugLog("patch total=%d", patched);
     return patched;
 }
 
@@ -544,11 +436,8 @@ static int TryPatchOnce(void) {
     SceKernelModuleInfo info;
     int count = 0;
 
-    int res = sceKernelGetModuleIdList(modules, sizeof(modules), &count);
-    if (res < 0) {
-        debugLog("module list failed res=%08x", res);
+    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0)
         return 0;
-    }
 
     for (int i = 0; i < count; i++) {
         memset(&info, 0, sizeof(info));
@@ -558,7 +447,6 @@ static int TryPatchOnce(void) {
             continue;
 
         if (strcmp(info.name, "Resistance") == 0) {
-            debugLog("found Resistance module uid=%08x", modules[i]);
             int patched = PatchResistanceModule(&info);
             if (patched > 0) {
                 g_patched = 1;
@@ -571,39 +459,24 @@ static int TryPatchOnce(void) {
 }
 
 static int PatchThread(SceSize args, void *argp) {
-    debugLog("patch thread start");
-
-    int emu = sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0);
-    debugLog("kemulator check res=%08x", emu);
-    if (emu != 0)
+    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0)
         return 0;
 
     for (int attempt = 0; attempt < 300 && !g_patched; attempt++) {
         int patched = TryPatchOnce();
-        if (patched > 0) {
-            debugLog("patch success attempt=%d patched=%d", attempt, patched);
+        if (patched > 0)
             return 0;
-        }
-
-        if ((attempt % 30) == 0)
-            debugLog("patch waiting attempt=%d", attempt);
 
         sceKernelDelayThread(100000);
     }
 
-    debugLog("patch thread exit patched=%d", g_patched);
     return 0;
 }
 
 int module_start(SceSize argc, void *argp) {
-    debugLogOnceInit();
-
     SceUID thid = sceKernelCreateThread("res_patch_thread", PatchThread, 0x18, 0x10000, PSP_THREAD_ATTR_USER, NULL);
-    debugLog("create patch thread thid=%08x", thid);
-    if (thid >= 0) {
-        int res = sceKernelStartThread(thid, 0, NULL);
-        debugLog("start patch thread res=%08x", res);
-    }
+    if (thid >= 0)
+        sceKernelStartThread(thid, 0, NULL);
 
     return 0;
 }
