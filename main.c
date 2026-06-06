@@ -1,9 +1,10 @@
 /*
   Remastered Controls: Resistance - PPSSPP port
 
-  Switch-safe branch:
+  Switch-safe debug branch:
   - Keeps Resistance's built-in Resistance Plus / PS3 controller path by faking usbpspcm0:.
-  - Does not clear normal PSP input after g_init_mode == 2. This prevents controls from dying on PPSSPP builds where the USB Plus path does not fully activate.
+  - Does not clear normal PSP input after g_init_mode == 2.
+  - Writes minimal static debug markers so we can see which hooks are reached on Switch.
 */
 
 #include <pspsdk.h>
@@ -17,6 +18,10 @@
 #include <string.h>
 
 #define EMULATOR_DEVCTL__IS_EMULATOR 0x00000003
+
+#define LOG_PATH_1        "ms0:/resistance_switch_debug.txt"
+#define LOG_PATH_2        "ms0:/PSP/resistance_switch_debug.txt"
+#define LOG_PATH_3        "ms0:/PSP/PLUGINS/resistance_remastered_ppsspp/switch_log.txt"
 
 #define FAKE_DEVNAME      "usbpspcm0:"
 #define FAKE_UID          0x12345678
@@ -55,12 +60,29 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 static SceCtrlData g_pad;
 static int g_init_mode = 0;
 static int g_patched = 0;
+static int g_logged_ctrl = 0;
+static int g_logged_pad_packet = 0;
 
 void _exit(int status) {
     sceKernelExitDeleteThread(status);
     while (1) {
         sceKernelDelayThread(1000000);
     }
+}
+
+static void writeLogFile(const char *path, const char *line) {
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, line, strlen(line));
+        sceIoWrite(fd, "\n", 1);
+        sceIoClose(fd);
+    }
+}
+
+static void logLine(const char *line) {
+    writeLogFile(LOG_PATH_1, line);
+    writeLogFile(LOG_PATH_2, line);
+    writeLogFile(LOG_PATH_3, line);
 }
 
 static int ptrInModule(const SceKernelModuleInfo *info, u32 p) {
@@ -176,12 +198,19 @@ static int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count) {
 
     memcpy(&g_pad, pad_data, sizeof(SceCtrlData));
 
+    if (!g_logged_ctrl) {
+        logLine("CTRL_HOOK_CALLED");
+        g_logged_ctrl = 1;
+    }
+
     return res;
 }
 
 static SceUID sceIoOpenPatched(const char *file, int flags, SceMode mode) {
-    if (strcmp(file, FAKE_DEVNAME) == 0)
+    if (strcmp(file, FAKE_DEVNAME) == 0) {
+        logLine("FAKE_USB_OPEN_CALLED");
         return FAKE_UID;
+    }
 
     return sceIoOpen(file, flags, mode);
 }
@@ -196,6 +225,7 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 1, 1);
             len = 3;
             g_init_mode++;
+            logLine("SEND_PLUS_ACTIVATE_PACKET");
         } else if (g_init_mode == 1) {
             SceIoStat stat;
             memset(&stat, 0, sizeof(SceIoStat));
@@ -205,6 +235,7 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
             snprintf((char *)data, size, "%1d%1d", 2, infected_mode);
             len = 3;
             g_init_mode++;
+            logLine("SEND_INFECTED_PACKET");
         } else {
             snprintf((char *)data, size, "%1d%04x%02x%02x%02x%02x",
                      0,
@@ -214,6 +245,11 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
                      g_pad.Lx,
                      g_pad.Ly);
             len = 14;
+
+            if (!g_logged_pad_packet) {
+                logLine("SEND_PAD_PACKET");
+                g_logged_pad_packet = 1;
+            }
         }
 
         return len;
@@ -223,15 +259,19 @@ static int sceIoReadPatched(SceUID fd, void *data, SceSize size) {
 }
 
 static int sceIoWritePatched(SceUID fd, const void *data, SceSize size) {
-    if (fd == FAKE_UID)
+    if (fd == FAKE_UID) {
+        logLine("FAKE_USB_WRITE_CALLED");
         return size;
+    }
 
     return sceIoWrite(fd, data, size);
 }
 
 static int sceIoClosePatched(SceUID fd) {
-    if (fd == FAKE_UID)
+    if (fd == FAKE_UID) {
+        logLine("FAKE_USB_CLOSE_CALLED");
         return 0;
+    }
 
     return sceIoClose(fd);
 }
@@ -241,30 +281,38 @@ static int sceIoDevctlPatched(const char *dev, unsigned int cmd, void *indata, i
         u32 conn[2];
         conn[0] = 0;
         conn[1] = 0x81;
+        logLine("DEVCTL_REGISTER_CALLED");
         return sceKernelStartThread(*(u32 *)indata, sizeof(conn), &conn);
     } else if (cmd == 0x03415002) {
+        logLine("DEVCTL_UNREGISTER_CALLED");
         return 0;
     } else if (cmd == 0x03435005) {
+        logLine("DEVCTL_BIND_CALLED");
         strcpy((char *)outdata, FAKE_DEVNAME);
         return 0;
     }
 
+    logLine("DEVCTL_OTHER_CALLED");
     return sceIoDevctl(dev, cmd, indata, inlen, outdata, outlen);
 }
 
 static int sceUsbStartPatched(const char *driverName, int size, void *args) {
+    logLine("USB_START_CALLED");
     return 0;
 }
 
 static int sceUsbStopPatched(const char *driverName, int size, void *args) {
+    logLine("USB_STOP_CALLED");
     return 0;
 }
 
 static int sceUsbActivatePatched(u32 pid) {
+    logLine("USB_ACTIVATE_CALLED");
     return 0;
 }
 
 static int sceUsbDeactivatePatched(u32 pid) {
+    logLine("USB_DEACTIVATE_CALLED");
     return 0;
 }
 
@@ -285,6 +333,11 @@ static int PatchResistanceModule(const SceKernelModuleInfo *info) {
     sceKernelDcacheWritebackAll();
     sceKernelIcacheClearAll();
 
+    if (patched > 0)
+        logLine("PATCHED_IMPORTS_OK");
+    else
+        logLine("PATCHED_IMPORTS_ZERO");
+
     return patched;
 }
 
@@ -293,8 +346,10 @@ static int TryPatchOnce(void) {
     SceKernelModuleInfo info;
     int count = 0;
 
-    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0)
+    if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0) {
+        logLine("GET_MODULE_LIST_FAILED");
         return 0;
+    }
 
     for (int i = 0; i < count; i++) {
         memset(&info, 0, sizeof(info));
@@ -304,6 +359,7 @@ static int TryPatchOnce(void) {
             continue;
 
         if (strcmp(info.name, "Resistance") == 0) {
+            logLine("RESISTANCE_MODULE_FOUND");
             int patched = PatchResistanceModule(&info);
             if (patched > 0) {
                 g_patched = 1;
@@ -316,17 +372,30 @@ static int TryPatchOnce(void) {
 }
 
 static int PatchThread(SceSize args, void *argp) {
-    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0)
+    sceIoRemove(LOG_PATH_1);
+    sceIoRemove(LOG_PATH_2);
+    sceIoRemove(LOG_PATH_3);
+
+    logLine("THREAD_STARTED");
+
+    if (sceIoDevctl("kemulator:", EMULATOR_DEVCTL__IS_EMULATOR, NULL, 0, NULL, 0) != 0) {
+        logLine("KEMULATOR_CHECK_FAILED");
         return 0;
+    }
+
+    logLine("KEMULATOR_CHECK_OK");
 
     for (int attempt = 0; attempt < 120 && !g_patched; attempt++) {
         int patched = TryPatchOnce();
-        if (patched > 0)
+        if (patched > 0) {
+            logLine("PATCH_THREAD_DONE");
             return 0;
+        }
 
         sceKernelDelayThread(100000);
     }
 
+    logLine("PATCH_THREAD_FAILED");
     return 0;
 }
 
